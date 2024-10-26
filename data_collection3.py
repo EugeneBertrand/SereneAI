@@ -1,109 +1,94 @@
 import pandas as pd
-from chembl_webresource_client.new_client import new_client
+import requests
+import pubchempy as pcp
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+import torch
+from torch.utils.data import Dataset, DataLoader
+import nemo.collections.nlp as nemo_nlp
 
-# Initialize ChEMBL client
-chembl_client = new_client.target
+# Step 1: Fetch receptor data from ChEMBL API
+def fetch_receptors(query):
+    url = f"https://www.ebi.ac.uk/chembl/api/data/target?search={query}"
+    response = requests.get(url)
+    if response.status_code == 200:
+        return response.json().get('targets', [])
+    else:
+        print(f"Error fetching data for {query}: {response.status_code}")
+        return []
 
-# Search for serotonin-related targets in the ChEMBL database
-serotonin_targets = chembl_client.search('serotonin')
+serotonin_receptors = fetch_receptors('serotonin receptor')
+gaba_receptors = fetch_receptors('GABA receptor')
 
-# Convert serotonin target data to a DataFrame
-def fetch_target_data(targets):
-    """
-    Convert target data into a DataFrame.
-    """
+# Step 2: Fetch bioactivity data for receptors
+def fetch_bioactivity_data(receptors, target='IC50'):
     data = []
-    for target in targets:
-        data.append({
-            'target_chembl_id': target.get('target_chembl_id'),
-            'pref_name': target.get('pref_name'),
-            'organism': target.get('organism'),
-            'target_type': target.get('target_type'),
-            'description': target.get('description')
-        })
+    for receptor in receptors:
+        receptor_id = receptor.get('target_chembl_id')
+        if receptor_id:
+            url = f"https://www.ebi.ac.uk/chembl/api/data/activity?target_chembl_id={receptor_id}&standard_type={target}"
+            response = requests.get(url)
+            if response.status_code == 200:
+                activities = response.json().get('activities', [])
+                data.extend(activities)
+            else:
+                print(f"Error fetching bioactivity data for {receptor_id}: {response.status_code}")
     return pd.DataFrame(data)
 
-# Fetch data and save to CSV
-serotonin_df = fetch_target_data(serotonin_targets)
-serotonin_df.to_csv('serotonin_targets.csv', index=False)
+serotonin_df = fetch_bioactivity_data(serotonin_receptors)
+gaba_df = fetch_bioactivity_data(gaba_receptors)
+bioactivity_data = pd.concat([serotonin_df, gaba_df]).drop_duplicates()
+bioactivity_data.to_csv('bioactivity_data.csv', index=False)
 
-# HTML Template Function
-def generate_html(data_file='serotonin_targets.csv', html_file='serotonin_targets.html'):
-    """
-    Generates an HTML page to display data from the CSV file.
-    """
-    html_content = f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Serotonin Targets - ChEMBL Data</title>
-        <style>
-            body {{
-                font-family: Arial, sans-serif;
-                background-color: #f4f7f9;
-                color: #333;
-                display: flex;
-                justify-content: center;
-                padding: 20px;
-            }}
-            .container {{
-                max-width: 900px;
-                background: white;
-                padding: 30px;
-                border-radius: 8px;
-                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-            }}
-            h1 {{
-                text-align: center;
-                color: #333;
-            }}
-            .target {{
-                background: #f9f9f9;
-                border: 1px solid #e0e0e0;
-                border-radius: 6px;
-                padding: 15px;
-                margin-bottom: 15px;
-            }}
-            .target h2 {{
-                color: #0073e6;
-            }}
-            .label {{
-                font-weight: bold;
-                color: #555;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Serotonin-Related Targets in ChEMBL</h1>
-    """
+# Step 3: Supplement bioactivity data with compound properties from PubChem
+compound_ids = [2244, 5288826, 2222]
+compound_data = []
+for cid in compound_ids:
+    compound = pcp.Compound.from_cid(cid)
+    compound_data.append({
+        'cid': cid,
+        'molecular_weight': compound.molecular_weight,
+        'logp': compound.xlogp,
+        'h_bond_donor_count': compound.h_bond_donor_count,
+        'h_bond_acceptor_count': compound.h_bond_acceptor_count
+    })
+compound_df = pd.DataFrame(compound_data)
+combined_data = pd.merge(bioactivity_data, compound_df, left_on='molecule_chembl_id', right_on='cid', how='inner')
+combined_data.to_csv('combined_bioactivity_data.csv', index=False)
 
-    # Read the CSV file to include data in HTML
-    df = pd.read_csv(data_file)
-    for _, row in df.iterrows():
-        html_content += f"""
-        <div class="target">
-            <h2>{row['pref_name'] or "Unnamed Target"}</h2>
-            <p><span class="label">ChEMBL ID:</span> {row['target_chembl_id']}</p>
-            <p><span class="label">Organism:</span> {row['organism']}</p>
-            <p><span class="label">Target Type:</span> {row['target_type']}</p>
-            <p><span class="label">Description:</span> {row['description'] or "N/A"}</p>
-        </div>
-        """
+# Step 4: Preprocess the data
+data = pd.read_csv('combined_bioactivity_data.csv')
+data = data.drop(columns=['molecule_chembl_id', 'cid']).dropna()
+
+scaler = StandardScaler()
+data[['molecular_weight', 'logp', 'h_bond_donor_count', 'h_bond_acceptor_count']] = scaler.fit_transform(
+    data[['molecular_weight', 'logp', 'h_bond_donor_count', 'h_bond_acceptor_count']]
+)
+
+if 'bioactivity_class' in data.columns:
+    encoder = LabelEncoder()
+    data['bioactivity_class'] = encoder.fit_transform(data['bioactivity_class'])
+
+data.to_csv('preprocessed_bioactivity_data.csv', index=False)
+
+# Step 5: Define a PyTorch Dataset and DataLoader
+class BioactivityDataset(Dataset):
+    def __init__(self, csv_file):
+        self.data = pd.read_csv(csv_file)
+        
+    def __len__(self):
+        return len(self.data)
     
-    # Closing HTML tags
-    html_content += """
-        </div>
-    </body>
-    </html>
-    """
-    
-    # Save the HTML content to a file
-    with open(html_file, 'w') as file:
-        file.write(html_content)
-    print(f"HTML file generated: {html_file}")
+    def __getitem__(self, idx):
+        features = self.data.iloc[idx, :-1].values  # All columns except target
+        target = self.data.iloc[idx, -1]  # Last column as target
+        return torch.tensor(features, dtype=torch.float32), torch.tensor(target, dtype=torch.long)
 
-# Generate HTML after saving CSV
-generate_html()
+dataset = BioactivityDataset('preprocessed_bioactivity_data.csv')
+train_loader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+# Step 6: Initialize and train a NeMo model
+# Note: Model type and parameters depend on the specific use case (e.g., TextClassificationModel, etc.)
+model = nemo_nlp.models.TextClassificationModel(...)  # Specify model details as per the task
+
+# Start training
+model.train(train_loader)
